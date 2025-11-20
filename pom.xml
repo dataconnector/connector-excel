@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.dataconnector</groupId>
+        <artifactId>connector-parent</artifactId>
+        <version>1.0.0</version>
+        <relativePath /> <!-- Lookup parent from repository -->
+    </parent>
+
+    <groupId>io.github.dataconnector</groupId>
+    <artifactId>connector-excel</artifactId>
+    <version>0.0.1</version>
+    <packaging>jar</packaging>
+
+    <name>Connector Excel</name>
+    <description>Excel Connector Implementation for Universal Data Connectors</description>
+    <url>https://github.com/dataconnector/connector-excel</url>
+
+    <issueManagement>
+        <system>GitHub Issues</system>
+        <url>https://github.com/dataconnector/connector-excel/issues</url>
+    </issueManagement>
+
+    <scm>
+        <connection>scm:git:git://github.com/dataconnector/connector-excel.git</connection>
+        <developerConnection>scm:git:ssh://github.com/dataconnector/connector-excel.git</developerConnection>
+        <url>https://github.com/dataconnector/connector-excel</url>
+        <tag>HEAD</tag>
+    </scm>
+
+    <developers>
+        <developer>
+            <id>haiphamcoder</id>
+            <name>Hai Pham Ngoc</name>
+            <email>ngochai285nd@gmail.com</email>
+        </developer>
+    </developers>
+
+    <licenses>
+        <license>
+            <name>Apache License 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+        </license>
+    </licenses>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.github.dataconnector</groupId>
+            <artifactId>connector-spi</artifactId>
+            <version>0.0.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.5.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-to-slf4j</artifactId>
+            <version>2.25.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.36</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.17</version>
+        </dependency>
+    </dependencies>
+
+</project>
