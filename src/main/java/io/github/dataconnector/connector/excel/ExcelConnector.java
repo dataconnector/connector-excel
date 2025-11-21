@@ -9,14 +9,19 @@ import java.io.OutputStream;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.Row;
@@ -30,14 +35,19 @@ import org.slf4j.LoggerFactory;
 import io.github.dataconnector.spi.DataSink;
 import io.github.dataconnector.spi.DataSource;
 import io.github.dataconnector.spi.DataStreamSink;
+import io.github.dataconnector.spi.DataStreamSource;
 import io.github.dataconnector.spi.model.ConnectorContext;
 import io.github.dataconnector.spi.model.ConnectorMetadata;
 import io.github.dataconnector.spi.model.ConnectorResult;
+import io.github.dataconnector.spi.stream.StreamCancellable;
+import io.github.dataconnector.spi.stream.StreamObserver;
 import io.github.dataconnector.spi.stream.StreamWriter;
 
-public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
+public class ExcelConnector implements DataSource, DataSink, DataStreamSource, DataStreamSink {
 
     private static final Logger logger = LoggerFactory.getLogger(ExcelConnector.class);
+
+    private final ExecutorService executor = Executors.newCachedThreadPool();
 
     @Override
     public String getType() {
@@ -64,7 +74,7 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
         if (configuration == null
                 || (!configuration.containsKey("file_path") && !configuration.containsKey("input_stream")
                         && !configuration.containsKey("output_stream"))) {
-            errors.add("Missing source: either 'file_path', 'input_stream' or 'output_stream' is required");
+            errors.add("Missing source/destination: either 'file_path', 'input_stream' or 'output_stream' is required");
         }
         return errors;
     }
@@ -105,6 +115,11 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
     public ConnectorResult read(ConnectorContext context) throws Exception {
         long startTime = System.currentTimeMillis();
 
+        int startRow = context.getConfiguration("start_row", Integer.class).orElse(0);
+        int limit = context.getConfiguration("limit", Integer.class).orElse(-1);
+        Set<Integer> includedColumns = parseIncludedColumns(context);
+        boolean skipEmptyRows = context.getConfiguration("skip_empty_rows", Boolean.class).orElse(true);
+
         try (InputStream inputStream = getInputStream(context)) {
             Workbook workbook = WorkbookFactory.create(inputStream);
 
@@ -116,7 +131,26 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
                         .build();
             }
 
-            List<Map<String, Object>> records = parseSheet(sheet, context);
+            Iterator<Row> rowIterator = sheet.iterator();
+            List<String> headers = extractHeaders(rowIterator, context);
+            for (int i = 0; i < startRow && rowIterator.hasNext(); i++) {
+                rowIterator.next();
+            }
+
+            List<Map<String, Object>> records = new ArrayList<>();
+            while (rowIterator.hasNext()) {
+                if (limit != -1 && records.size() >= limit) {
+                    break;
+                }
+
+                Row row = rowIterator.next();
+                if (skipEmptyRows && isRowEmpty(row)) {
+                    continue;
+                }
+
+                Map<String, Object> record = parseRow(row, headers, includedColumns);
+                records.add(record);
+            }
 
             return ConnectorResult.builder()
                     .success(true)
@@ -126,6 +160,52 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
                     .executionTimeMillis(System.currentTimeMillis() - startTime)
                     .build();
         }
+    }
+
+    @Override
+    public StreamCancellable startStream(ConnectorContext context, StreamObserver observer) throws Exception {
+        AtomicBoolean running = new AtomicBoolean(true);
+
+        Set<Integer> includedColumns = parseIncludedColumns(context);
+        boolean skipEmptyRows = context.getConfiguration("skip_empty_rows", Boolean.class).orElse(true);
+        int startRow = context.getConfiguration("start_row", Integer.class).orElse(0);
+
+        executor.submit(() -> {
+            try (InputStream inputStream = getInputStream(context)) {
+                Workbook workbook = WorkbookFactory.create(inputStream);
+
+                Sheet sheet = getSheet(context, workbook);
+                if (sheet == null) {
+                    throw new IllegalArgumentException("Sheet not found");
+                }
+
+                Iterator<Row> rowIterator = sheet.iterator();
+                List<String> headers = extractHeaders(rowIterator, context);
+                for (int i = 0; i < startRow && rowIterator.hasNext(); i++) {
+                    rowIterator.next();
+                }
+
+                while (rowIterator.hasNext() && running.get()) {
+                    Row row = rowIterator.next();
+                    if (skipEmptyRows && isRowEmpty(row)) {
+                        continue;
+                    }
+
+                    Map<String, Object> record = parseRow(row, headers, includedColumns);
+                    observer.onNext(record);
+                }
+                logger.info("Excel stream reader completed");
+                observer.onComplete();
+            } catch (Exception e) {
+                logger.error("Error in Excel stream reader", e);
+                observer.onError(e);
+            }
+        });
+
+        return () -> {
+            logger.info("Requesting stream cancellation");
+            running.set(false);
+        };
     }
 
     private InputStream getInputStream(ConnectorContext context) throws Exception {
@@ -163,46 +243,6 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
         }
     }
 
-    private List<Map<String, Object>> parseSheet(Sheet sheet, ConnectorContext context) {
-        List<Map<String, Object>> records = new ArrayList<>();
-        Iterator<Row> rowIterator = sheet.rowIterator();
-
-        int headerRowIndex = context.getConfiguration("header_row", Integer.class).orElse(0);
-        for (int i = 0; i < headerRowIndex && rowIterator.hasNext(); i++) {
-            rowIterator.next();
-        }
-
-        if (!rowIterator.hasNext()) {
-            return records;
-        }
-
-        Row headerRow = rowIterator.next();
-        List<String> headers = new ArrayList<>();
-        for (Cell cell : headerRow) {
-            headers.add(getCellValue(cell).toString());
-        }
-
-        while (rowIterator.hasNext()) {
-            Row row = rowIterator.next();
-            Map<String, Object> record = new LinkedHashMap<>();
-            boolean hasData = false;
-
-            for (int i = 0; i < headers.size(); i++) {
-                Cell cell = row.getCell(i, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
-                if (cell != null) {
-                    record.put(headers.get(i), getCellValue(cell));
-                    hasData = true;
-                }
-            }
-
-            if (hasData) {
-                records.add(record);
-            }
-        }
-
-        return records;
-    }
-
     private Object getCellValue(Cell cell) {
         switch (cell.getCellType()) {
             case STRING:
@@ -224,6 +264,90 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
             default:
                 return "";
         }
+    }
+
+    private Set<Integer> parseIncludedColumns(ConnectorContext context) {
+        Object columnsConfig = context.getConfiguration().get("columns");
+        if (columnsConfig == null) {
+            return null;
+        }
+
+        Set<Integer> indices = new HashSet<>();
+        try {
+            if (columnsConfig instanceof String) {
+                String[] parts = ((String) columnsConfig).split(",");
+                for (String part : parts) {
+                    part = part.trim();
+                    if (part.contains("-")) {
+                        String[] range = part.split("-");
+                        if (range.length != 2) {
+                            throw new IllegalArgumentException("Invalid column range: " + part);
+                        }
+                        int start = Integer.parseInt(range[0].trim());
+                        int end = Integer.parseInt(range[1].trim());
+                        for (int i = start; i <= end; i++) {
+                            indices.add(i);
+                        }
+                    } else {
+                        int index = Integer.parseInt(part);
+                        indices.add(index);
+                    }
+                }
+            } else if (columnsConfig instanceof List) {
+                for (Object item : (List<?>) columnsConfig) {
+                    indices.add(Integer.parseInt(item.toString()));
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to parse 'columns' config", e);
+            return null;
+        }
+        return indices.isEmpty() ? null : indices;
+    }
+
+    private boolean isRowEmpty(Row row) {
+        if (row == null || row.getLastCellNum() <= 0) {
+            return true;
+        }
+        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            if (cell != null && cell.getCellType() != CellType.BLANK) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Map<String, Object> parseRow(Row row, List<String> headers, Set<Integer> includedColumns) {
+        Map<String, Object> record = new LinkedHashMap<>();
+        int maxCells = row.getLastCellNum();
+
+        for (int i = 0; i < maxCells; i++) {
+            if (includedColumns != null && !includedColumns.contains(i)) {
+                continue;
+            }
+
+            String key = (i < headers.size()) ? headers.get(i) : "column_" + (i - headers.size() + 1);
+            Cell cell = row.getCell(i, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+            Object value = (cell == null) ? null : getCellValue(cell);
+            record.put(key, value);
+        }
+        return record;
+    }
+
+    private List<String> extractHeaders(Iterator<Row> rowIterator, ConnectorContext context) {
+        boolean useFirstRowAsHeaders = context.getConfiguration("use_first_row_as_headers", Boolean.class).orElse(true);
+        List<String> headers = new ArrayList<>();
+
+        if (useFirstRowAsHeaders && rowIterator.hasNext()) {
+            Row headerRow = rowIterator.next();
+            for (Cell cell : headerRow) {
+                headers.add(getCellValue(cell).toString());
+            }
+        } else {
+            //
+        }
+        return headers;
     }
 
     private class ExcelStreamWriter implements StreamWriter {
@@ -289,10 +413,17 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
                 initializeSheet(records.get(0).keySet());
             }
 
+            Set<Integer> includedColumns = parseIncludedColumns(context);
+
             for (Map<String, Object> record : records) {
                 Row row = sheet.createRow(currentRowIndex++);
                 int cellIndex = 0;
-                for (String header : headers) {
+
+                for (int i = 0; i < headers.size(); i++) {
+                    if (includedColumns != null && !includedColumns.contains(i)) {
+                        continue;
+                    }
+                    String header = headers.get(i);
                     Cell cell = row.createCell(cellIndex++);
                     Object value = record.get(header);
                     setCellValue(cell, value);
@@ -303,21 +434,30 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
 
         private void initializeSheet(Set<String> keySet) {
             String sheetName = context.getConfiguration("sheet_name", String.class).orElse("Sheet1");
+            boolean withHeader = context.getConfiguration("use_first_row_as_headers", Boolean.class).orElse(true);
+
             this.sheet = workbook.createSheet(sheetName);
             this.headers = new ArrayList<>(keySet);
 
-            Row headerRow = sheet.createRow(currentRowIndex++);
-            CellStyle boldStyle = workbook.createCellStyle();
-            Font font = workbook.createFont();
-            font.setBold(true);
-            boldStyle.setFont(font);
+            if (withHeader) {
+                Row headerRow = sheet.createRow(currentRowIndex++);
+                CellStyle boldStyle = workbook.createCellStyle();
+                Font font = workbook.createFont();
+                font.setBold(true);
+                boldStyle.setFont(font);
 
-            int cellIndex = 0;
-            for (String header : headers) {
-                Cell cell = headerRow.createCell(cellIndex++);
-                cell.setCellValue(header);
-                cell.setCellStyle(boldStyle);
+                int cellIndex = 0;
+                Set<Integer> includedColumns = parseIncludedColumns(context);
+                for (int i = 0; i < headers.size(); i++) {
+                    if (includedColumns != null && !includedColumns.contains(i)) {
+                        continue;
+                    }
+                    Cell cell = headerRow.createCell(cellIndex++);
+                    cell.setCellValue(headers.get(i));
+                    cell.setCellStyle(boldStyle);
+                }
             }
+
         }
 
         private void setCellValue(Cell cell, Object value) {
@@ -334,5 +474,4 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
             }
         }
     }
-
 }
