@@ -169,6 +169,7 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSource, D
         Set<Integer> includedColumns = parseIncludedColumns(context);
         boolean skipEmptyRows = context.getConfiguration("skip_empty_rows", Boolean.class).orElse(true);
         int startRow = context.getConfiguration("start_row", Integer.class).orElse(0);
+        int limit = context.getConfiguration("limit", Integer.class).orElse(-1);
 
         executor.submit(() -> {
             try (InputStream inputStream = getInputStream(context)) {
@@ -185,7 +186,12 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSource, D
                     rowIterator.next();
                 }
 
+                int recordsProcessed = 0;
                 while (rowIterator.hasNext() && running.get()) {
+                    if (limit != -1 && recordsProcessed >= limit) {
+                        break;
+                    }
+
                     Row row = rowIterator.next();
                     if (skipEmptyRows && isRowEmpty(row)) {
                         continue;
@@ -193,8 +199,9 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSource, D
 
                     Map<String, Object> record = parseRow(row, headers, includedColumns);
                     observer.onNext(record);
+                    recordsProcessed++;
                 }
-                logger.info("Excel stream reader completed");
+                logger.info("Excel stream reader completed with {} records", recordsProcessed);
                 observer.onComplete();
             } catch (Exception e) {
                 logger.error("Error in Excel stream reader", e);
