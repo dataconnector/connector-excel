@@ -2,21 +2,28 @@ package io.github.dataconnector.connector.excel;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellStyle;
 import org.apache.poi.ss.usermodel.DateUtil;
+import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,15 +70,35 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
     }
 
     @Override
-    public StreamWriter createWriter(ConnectorContext arg0) throws IOException {
-        // TODO Auto-generated method stub
-        throw new UnsupportedOperationException("Unimplemented method 'createWriter'");
+    public StreamWriter createWriter(ConnectorContext context) throws IOException {
+        return new ExcelStreamWriter(context);
     }
 
     @Override
     public ConnectorResult write(ConnectorContext context, List<Map<String, Object>> data) throws Exception {
-        // TODO Auto-generated method stub
-        throw new UnsupportedOperationException("Unimplemented method 'write'");
+        long startTime = System.currentTimeMillis();
+
+        if (data == null || data.isEmpty()) {
+            return ConnectorResult.builder()
+                    .success(true)
+                    .message("No data to write")
+                    .recordsProcessed(0)
+                    .records(data)
+                    .executionTimeMillis(System.currentTimeMillis() - startTime)
+                    .build();
+        }
+
+        try (StreamWriter writer = createWriter(context)) {
+            writer.writeBatch(data);
+        }
+
+        return ConnectorResult.builder()
+                .success(true)
+                .message("Successfully wrote " + data.size() + " records to Excel file")
+                .recordsProcessed(data.size())
+                .records(data)
+                .executionTimeMillis(System.currentTimeMillis() - startTime)
+                .build();
     }
 
     @Override
@@ -115,6 +142,7 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
 
             URL url = getClass().getClassLoader().getResource(filePath);
             if (url != null) {
+                logger.info("Reading Excel file from URL: {}", url.toString());
                 return url.openStream();
             }
             throw new IllegalArgumentException("File not found: " + filePath);
@@ -195,6 +223,115 @@ public class ExcelConnector implements DataSource, DataSink, DataStreamSink {
                 return cell.getCellFormula();
             default:
                 return "";
+        }
+    }
+
+    private class ExcelStreamWriter implements StreamWriter {
+
+        private final ConnectorContext context;
+        private SXSSFWorkbook workbook;
+        private Sheet sheet;
+        private OutputStream outputStream;
+        private boolean isClosed = false;
+        private int currentRowIndex = 0;
+        private List<String> headers;
+
+        public ExcelStreamWriter(ConnectorContext context) {
+            this.context = context;
+            this.workbook = new SXSSFWorkbook(100);
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (isClosed) {
+                return;
+            }
+            isClosed = true;
+
+            try {
+                String filePath = context.getConfiguration("file_path", String.class).orElse(null);
+                Object outputStreamObject = context.getConfiguration().get("output_stream");
+
+                if (outputStreamObject instanceof OutputStream) {
+                    this.outputStream = (OutputStream) outputStreamObject;
+                } else if (filePath != null) {
+                    File file = new File(filePath);
+                    if (file.getParentFile() != null && !file.getParentFile().exists()) {
+                        if (!file.getParentFile().mkdirs()) {
+                            throw new IOException("Failed to create parent directories for " + filePath);
+                        }
+                    }
+                    this.outputStream = new FileOutputStream(file);
+                } else {
+                    throw new IllegalArgumentException(
+                            "Missing output: either 'file_path' or 'output_stream' is required");
+                }
+                workbook.write(outputStream);
+            } finally {
+                workbook.close();
+
+                if (outputStream != null && context.getConfiguration().containsKey("file_path")) {
+                    outputStream.close();
+                }
+            }
+        }
+
+        @Override
+        public void writeBatch(List<Map<String, Object>> records) throws IOException {
+            if (isClosed) {
+                throw new IOException("StreamWriter is already closed");
+            }
+            if (records == null || records.isEmpty()) {
+                return;
+            }
+
+            if (sheet == null) {
+                initializeSheet(records.get(0).keySet());
+            }
+
+            for (Map<String, Object> record : records) {
+                Row row = sheet.createRow(currentRowIndex++);
+                int cellIndex = 0;
+                for (String header : headers) {
+                    Cell cell = row.createCell(cellIndex++);
+                    Object value = record.get(header);
+                    setCellValue(cell, value);
+                }
+            }
+
+        }
+
+        private void initializeSheet(Set<String> keySet) {
+            String sheetName = context.getConfiguration("sheet_name", String.class).orElse("Sheet1");
+            this.sheet = workbook.createSheet(sheetName);
+            this.headers = new ArrayList<>(keySet);
+
+            Row headerRow = sheet.createRow(currentRowIndex++);
+            CellStyle boldStyle = workbook.createCellStyle();
+            Font font = workbook.createFont();
+            font.setBold(true);
+            boldStyle.setFont(font);
+
+            int cellIndex = 0;
+            for (String header : headers) {
+                Cell cell = headerRow.createCell(cellIndex++);
+                cell.setCellValue(header);
+                cell.setCellStyle(boldStyle);
+            }
+        }
+
+        private void setCellValue(Cell cell, Object value) {
+            if (value == null) {
+                cell.setBlank();
+            } else if (value instanceof Number) {
+                cell.setCellValue(((Number) value).doubleValue());
+            } else if (value instanceof Boolean) {
+                cell.setCellValue((Boolean) value);
+            } else if (value instanceof Date) {
+                cell.setCellValue((Date) value);
+            } else {
+                cell.setCellValue(value.toString());
+            }
         }
     }
 
